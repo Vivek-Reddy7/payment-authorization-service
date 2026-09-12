@@ -1,0 +1,47 @@
+# Default profile runs entirely in memory, so `mvn spring-boot:run` works on a
+# clean machine with no database to install first. The mysql profile below is
+# the one that matters for anything real.
+spring:
+  application:
+    name: payment-authorization-service
+  datasource:
+    url: jdbc:h2:mem:payments;DB_CLOSE_DELAY=-1;MODE=MySQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    # Schema comes from Flyway, never from Hibernate. ddl-auto guesses, and a
+    # guess that drops a column in a payments store is not recoverable from.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Health only. The others describe internals and there is no auth on
+        # this service yet.
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+payments:
+  limits:
+    # 500.00 in minor units.
+    per-transaction-minor: 50000
+  blocked-bins: 400000,411111
+  # Local default ONLY. In any deployed environment this must come from the
+  # environment, because a pepper in source control is not a secret -- and
+  # rotating it invalidates every stored fingerprint, so it is not a thing to
+  # change casually either.
+  card:
+    pepper: ${PAYMENTS_CARD_PEPPER:local-development-pepper-not-a-secret}
+
+logging:
+  level:
+    com.vivekreddy.payments: INFO

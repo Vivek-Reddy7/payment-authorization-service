@@ -1,0 +1,17 @@
+# Run with: --spring.profiles.active=mysql
+#
+# Nothing here carries a credential. The URL, user and password all come from
+# the environment so that the same built artifact runs in every environment,
+# which is the only way to be sure the thing tested is the thing deployed.
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/payments}
+    username: ${DB_USER:payments}
+    password: ${DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQLDialect

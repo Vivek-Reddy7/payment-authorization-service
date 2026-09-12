@@ -1,0 +1,44 @@
+# CI. Red blocks merge -- a suite that gates nothing is a suite people stop
+# reading.
+#
+# No services block and no database container: the default profile runs on H2 in
+# memory and Flyway builds the schema, so the whole suite runs anywhere with a
+# JDK. The MySQL profile is exercised by running it, not by CI.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Tests
+        run: ./mvnw -B test
+
+      # Proves the jar actually assembles. `test` passing does not.
+      - name: Package
+        run: ./mvnw -B -DskipTests package
+
+      # A new advisory against a transitive dependency can land overnight with
+      # no fix available, so this reports rather than blocks.
+      - name: Dependency vulnerabilities
+        continue-on-error: true
+        run: ./mvnw -B dependency:tree
