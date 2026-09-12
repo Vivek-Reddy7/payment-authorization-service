@@ -12,6 +12,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.YearMonth;
 import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -76,7 +77,7 @@ public class AuthorizationService {
                             new AuthorizationNotFoundException(record.getAuthorizationId()));
         }
 
-        Instant now = clock.instant();
+        Instant now = now();
         YearMonth today = YearMonth.from(now.atZone(ZoneOffset.UTC));
         Decision decision = decisionEngine.decide(
                 request.pan(), request.expiry(), request.amountMinor(), today);
@@ -129,8 +130,28 @@ public class AuthorizationService {
         Authorization authorization = authorizations.findById(id)
                 .orElseThrow(() -> new AuthorizationNotFoundException(id));
         // Throws if the move is illegal. The entity owns that rule.
-        authorization.transitionTo(target, clock.instant());
+        authorization.transitionTo(target, now());
         return authorizations.save(authorization);
+    }
+
+    /**
+     * The current instant, truncated to the precision the database actually
+     * stores.
+     *
+     * <p>Without the truncation, the timestamp returned when an authorization is
+     * created differs from the one returned by every later read of it. The create
+     * response is serialised from the in-memory entity, which carries whatever
+     * precision the platform clock offers -- nanoseconds on Linux -- while the
+     * column is TIMESTAMP(6) and keeps microseconds. The value silently loses its
+     * tail on the way to disk.
+     *
+     * <p>Found by CI on Linux after passing on macOS, where the clock happens to
+     * tick in microseconds already and the two agreed by luck. A client caching a
+     * create response and later comparing it against a GET would have seen two
+     * different timestamps for one authorization.
+     */
+    private Instant now() {
+        return clock.instant().truncatedTo(ChronoUnit.MICROS);
     }
 
     /**

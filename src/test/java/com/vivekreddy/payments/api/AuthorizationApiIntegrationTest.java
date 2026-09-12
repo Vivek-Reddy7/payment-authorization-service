@@ -188,6 +188,38 @@ class AuthorizationApiIntegrationTest {
     }
 
     @Test
+    @DisplayName("the timestamp in the create response survives a round trip")
+    void timestampsRoundTrip() throws Exception {
+        // The create response is serialised from the in-memory entity; every
+        // later read comes from the database. If the entity carries more
+        // precision than the column stores, those two disagree and a client
+        // comparing them sees one authorization with two creation times.
+        //
+        // This passed on macOS and failed on Linux CI, because the platform
+        // clock there exposes nanoseconds while the column is TIMESTAMP(6).
+        // Asserting the round trip pins the invariant rather than the platform.
+        String created = mockMvc.perform(post("/api/v1/authorizations")
+                        .header("Idempotency-Key", "it-roundtrip-1")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(GOOD_PAN, 7_500L, "order-roundtrip-1")))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode createdNode = objectMapper.readTree(created);
+        String id = createdNode.get("id").asText();
+
+        String fetched = mockMvc.perform(get("/api/v1/authorizations/{id}", id))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+
+        JsonNode fetchedNode = objectMapper.readTree(fetched);
+        assertThat(fetchedNode.get("createdAt").asText())
+                .isEqualTo(createdNode.get("createdAt").asText());
+        assertThat(fetchedNode.get("updatedAt").asText())
+                .isEqualTo(createdNode.get("updatedAt").asText());
+    }
+
+    @Test
     @DisplayName("an unknown id is a 404")
     void unknownId() throws Exception {
         mockMvc.perform(get("/api/v1/authorizations/{id}",
