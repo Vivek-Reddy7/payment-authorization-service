@@ -1,5 +1,8 @@
 # payment-authorization-service
 
+[![ci](https://github.com/Vivek-Reddy7/payment-authorization-service/actions/workflows/ci.yml/badge.svg)](https://github.com/Vivek-Reddy7/payment-authorization-service/actions/workflows/ci.yml)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 A card payment authorization API in **Java 21 and Spring Boot 4**. It authorizes
 a card, records the decision, and lets that authorization be captured or voided
 exactly once.
@@ -65,8 +68,15 @@ different amount and you get a `409`.
 | `POST /api/v1/authorizations/{id}/capture` | Take the funds |
 | `POST /api/v1/authorizations/{id}/void` | Release without taking |
 
-Errors are [RFC 7807](https://www.rfc-editor.org/rfc/rfc7807) problem documents,
-produced in one place so every endpoint fails the same shape.
+Errors from the rules this service enforces itself (validation, not-found,
+illegal state transitions, idempotency conflicts) are [RFC
+7807](https://www.rfc-editor.org/rfc/rfc7807) problem documents, produced in
+one place. Not yet true of every error Spring Boot can produce before
+reaching that layer: a missing header, malformed JSON, an unknown query
+value, or a bad path variable currently fall through to the framework's
+default error body instead — and an over-length `Idempotency-Key` returns a
+raw 500 rather than a 400. See [the project
+analysis](docs/project-analysis.md).
 
 ## The four decisions worth explaining
 
@@ -84,12 +94,25 @@ card numbers is small enough to enumerate, and a leaked column of *unpeppered*
 digests would be a leaked column of card numbers. Data you do not hold cannot
 leak.
 
-**Retries are safe by construction.** A client that times out mid-request cannot
-know whether the card was authorized, so it retries — and without an idempotency
-key the cardholder is authorized twice. The stored record also fingerprints the
+**Retries are intended to be safe by construction, and currently are not under
+real concurrency.** A client that times out mid-request cannot know whether
+the card was authorized, so it retries — and without an idempotency key the
+cardholder is authorized twice. The stored record also fingerprints the
 request body, which is what makes it honest: without that, a caller could
 authorize $10, reuse the key for $10,000, and be handed the cached approval.
 Same key and same body replays; same key and different body is refused.
+
+**This review found that it does not hold under concurrency.** Sixteen
+concurrent requests carrying the same key and the same body produced **five**
+separate authorizations, not one, with the idempotency record pointing at
+only one of them. `@Transactional` does commit each method on its own, but
+nothing stops two overlapping transactions from both reading "no existing
+record" before either commits its insert — the default isolation does not
+prevent that race — and `JpaRepository.save()` on an entity built with a
+pre-assigned `@Id` performs a merge-style upsert rather than a guaranteed
+`INSERT`, so it does not reliably collide on the primary key the way a plain
+insert would. See [the project analysis](docs/project-analysis.md) for the
+reproduction and the fix this needs.
 
 **The state machine lives on the entity.** `APPROVED` can become `CAPTURED` or
 `VOIDED`; everything else is terminal. The check sits on `Authorization` rather
@@ -113,7 +136,7 @@ from. There are no down scripts for the same reason — fix forward with `V2`.
 
 ## Tests
 
-35 tests, all green, no network and no database to install.
+36 tests, all green, no network and no database to install.
 
 The decision engine is a pure function — it reads no clock and touches no
 database, because "today" is an argument — so its rules are unit tested
@@ -129,12 +152,35 @@ also asserts that the raw response body contains neither the PAN nor the string
 `fingerprint`, which catches a field added later that no targeted assertion is
 watching.
 
+## How this compares
+
+It does not compete with real payments infrastructure, and does not try to.
+
+| Alternative | What it is | Why it is not the same thing |
+|---|---|---|
+| [Hyperswitch](https://github.com/juspay/hyperswitch) | PCI-compliant payments orchestration platform (Apache-2.0) | Routes to real processors; this project authorizes nothing real |
+| [Kill Bill](https://github.com/killbill/killbill) | Open-source billing and payments platform (Apache-2.0) | Billing-first, with authorization as one small piece of a much larger system |
+| [jPOS](https://github.com/jpos/jPOS) | Framework for ISO-8583 financial switches (AGPL-3.0) | The real protocol card networks speak, not a REST API |
+| Stripe's idempotency design | Documented behaviour, not a repository | The reference this project's idempotency design follows |
+
+What it offers instead is a small, readable implementation of the standard
+patterns (minor-unit money, peppered card hashing, an entity-owned state
+machine, idempotency keys) with the reasoning written down. The [project
+analysis](docs/project-analysis.md) rates its novelty **Low** — intentionally,
+since the goal was learning the patterns, not inventing new ones — and sets
+out the strongest criticisms, including the concurrency defect above.
+
 ## What is deliberately missing
 
 No authentication, no rate limiting, no real issuer integration, no partial
-captures or refunds, no expiry of stale authorizations. Those are the next
-things, not oversights — and this is a learning project, so I would rather it be
-small and correct than broad and hand-waved.
+captures or refunds, no expiry of stale authorizations, no currency-specific
+minor-unit enforcement (a `JPY` or `KWD` amount is accepted and limited the
+same way a `USD` one is, despite the reasoning above about why that is
+wrong). Those are the next things, not oversights — and this is a learning
+project, so I would rather it be small and correct than broad and
+hand-waved. The concurrency and error-handling defects in [the project
+analysis](docs/project-analysis.md) are not on this list because they were
+meant to already be solved, and are the priority once discovered.
 
 ## Licence
 
