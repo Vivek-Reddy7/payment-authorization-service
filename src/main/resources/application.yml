@@ -9,6 +9,14 @@ spring:
     driver-class-name: org.h2.Driver
     username: sa
     password:
+    hikari:
+      # The idempotency claim (IdempotencyClaimer) runs in its own
+      # REQUIRES_NEW transaction, which needs a second connection while the
+      # caller's transaction is suspended but still holds its own. The
+      # default pool size of 10 is enough for 5 genuinely concurrent
+      # requests; this is enough for real traffic and for the concurrency
+      # test that proves the idempotency fix.
+      maximum-pool-size: 30
   jpa:
     # Schema comes from Flyway, never from Hibernate. ddl-auto guesses, and a
     # guess that drops a column in a payments store is not recoverable from.

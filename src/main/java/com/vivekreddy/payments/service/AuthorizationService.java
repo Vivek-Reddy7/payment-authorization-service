@@ -14,6 +14,8 @@ import java.time.YearMonth;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.UUID;
+import org.hibernate.exception.ConstraintViolationException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -31,17 +33,20 @@ public class AuthorizationService {
 
     private final AuthorizationRepository authorizations;
     private final IdempotencyRecordRepository idempotencyRecords;
+    private final IdempotencyClaimer idempotencyClaimer;
     private final DecisionEngine decisionEngine;
     private final CardFingerprinter fingerprinter;
     private final Clock clock;
 
     public AuthorizationService(AuthorizationRepository authorizations,
                                 IdempotencyRecordRepository idempotencyRecords,
+                                IdempotencyClaimer idempotencyClaimer,
                                 DecisionEngine decisionEngine,
                                 CardFingerprinter fingerprinter,
                                 Clock clock) {
         this.authorizations = authorizations;
         this.idempotencyRecords = idempotencyRecords;
+        this.idempotencyClaimer = idempotencyClaimer;
         this.decisionEngine = decisionEngine;
         this.fingerprinter = fingerprinter;
         this.clock = clock;
@@ -62,19 +67,9 @@ public class AuthorizationService {
     public Authorization authorize(AuthorizationRequest request, String idempotencyKey) {
         String fingerprint = fingerprinter.hash(canonical(request));
 
-        // The replay check and the insert share one transaction, so two
-        // concurrent retries cannot both pass the check and both authorize. The
-        // primary key on idempotency_key is the backstop if they somehow do:
-        // the second insert violates it and that transaction rolls back.
         var existing = idempotencyRecords.findById(idempotencyKey);
         if (existing.isPresent()) {
-            IdempotencyRecord record = existing.get();
-            if (!record.matches(fingerprint)) {
-                throw new IdempotencyConflictException(idempotencyKey);
-            }
-            return authorizations.findById(record.getAuthorizationId())
-                    .orElseThrow(() ->
-                            new AuthorizationNotFoundException(record.getAuthorizationId()));
+            return replayOrConflict(existing.get(), fingerprint);
         }
 
         Instant now = now();
@@ -92,15 +87,39 @@ public class AuthorizationService {
                         last4, cardFingerprint, request.merchantReference(),
                         decision.reason(), now);
 
-        Authorization saved = authorizations.save(authorization);
-
         // Declines are recorded too. A client retrying a declined request must
         // get the same decline, not a fresh attempt -- otherwise the key stops
         // being a guarantee precisely when the caller is retrying hardest.
-        idempotencyRecords.save(
-                new IdempotencyRecord(idempotencyKey, fingerprint, saved.getId(), now));
+        //
+        // The authorization and its idempotency claim are written together, in
+        // their own independent transaction (see IdempotencyClaimer): either
+        // both commit, or a concurrent winner's key collision rolls both back,
+        // leaving nothing behind for this losing attempt to clean up. The
+        // exception is caught here, in this (separate, unaffected) transaction
+        // -- not inside the claim itself, which would leave Spring trying to
+        // commit a transaction Hibernate has already marked unusable.
+        try {
+            return idempotencyClaimer.claim(authorization, idempotencyKey, fingerprint, now);
+        } catch (DataIntegrityViolationException | ConstraintViolationException e) {
+            // Lost the race: a concurrent request claimed this key first and
+            // already committed. The claim's own insert only fails this way
+            // once that row genuinely exists to collide with, so it is
+            // visible to this read.
+            IdempotencyRecord winner = idempotencyRecords.findById(idempotencyKey)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "lost the idempotency race for " + idempotencyKey
+                                    + " but found no winning record"));
+            return replayOrConflict(winner, fingerprint);
+        }
+    }
 
-        return saved;
+    private Authorization replayOrConflict(IdempotencyRecord record, String fingerprint) {
+        if (!record.matches(fingerprint)) {
+            throw new IdempotencyConflictException(record.getIdempotencyKey());
+        }
+        return authorizations.findById(record.getAuthorizationId())
+                .orElseThrow(() ->
+                        new AuthorizationNotFoundException(record.getAuthorizationId()));
     }
 
     @Transactional

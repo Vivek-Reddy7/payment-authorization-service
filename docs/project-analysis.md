@@ -127,24 +127,52 @@ for a deliberately fake payments domain with no real integration.
 
 **Technical**
 
-- **The headline idempotency guarantee does not hold under real concurrency.**
-  The README states: *"The replay check and the insert share one transaction,
-  so two concurrent retries cannot both pass the check and both authorize. The
-  primary key on `idempotency_key` is the backstop if they somehow do: the
-  second insert violates it and that transaction rolls back."* Firing 16
-  concurrent, identical requests (same key, same body) at a running instance
-  produced **5 separate authorizations**, not 1, with the idempotency record
-  pointing at only one of them and 4 authorizations silently orphaned — the
-  exact double-authorization this feature exists to prevent. Each `@Transactional`
-  method does commit on its own, but nothing stops two overlapping
-  transactions from both running `findById` before either commits its insert,
-  because the default isolation (`READ_COMMITTED`, left at Spring's default) does
-  not prevent that race, and `idempotency_key` is the method's own primary key,
-  not a separately validated uniqueness check at this layer. The stated
-  "backstop" does not trigger here because `JpaRepository.save()` on an entity
-  constructed with a pre-assigned, non-generated `@Id` performs a merge-style
-  upsert rather than a guaranteed `INSERT`, so two concurrent `save()` calls
-  with the same key do not reliably collide the way the comment assumes.
+- **The headline idempotency guarantee did not hold under real concurrency —
+  fixed as of this review, 2026-10-10.** The README stated: *"The replay check
+  and the insert share one transaction, so two concurrent retries cannot both
+  pass the check and both authorize. The primary key on `idempotency_key` is
+  the backstop if they somehow do: the second insert violates it and that
+  transaction rolls back."* Firing 16 concurrent, identical requests (same
+  key, same body) at a running instance produced **5 separate authorizations**,
+  not 1, with the idempotency record pointing at only one of them and 4
+  authorizations silently orphaned — the exact double-authorization this
+  feature exists to prevent. Each `@Transactional` method does commit on its
+  own, but nothing stops two overlapping transactions from both running
+  `findById` before either commits its insert, because the default isolation
+  (`READ_COMMITTED`, left at Spring's default) does not prevent that race, and
+  `idempotency_key` is the method's own primary key, not a separately
+  validated uniqueness check at this layer. The stated "backstop" did not
+  trigger because `JpaRepository.save()` on an entity constructed with a
+  pre-assigned, non-generated `@Id` performs a merge-style upsert rather than
+  a guaranteed `INSERT` — worse than merely failing to collide: on a key a
+  concurrent winner had already committed, `merge()` found that row and
+  issued a silent `UPDATE`, overwriting which authorization the key pointed
+  at with no exception raised at all.
+
+  **The fix** (`IdempotencyClaimer`, called from `AuthorizationService`):
+  the authorization and its idempotency record are now written together, with
+  `entityManager.persist()` (always a real `INSERT`), in one independent
+  (`REQUIRES_NEW`) transaction. Two further pitfalls surfaced building it,
+  each worth recording: first, claiming the idempotency key in its own
+  transaction *after* saving the authorization in the caller's still-open one
+  does not work, because the record's foreign key points at a row the
+  independent transaction cannot see yet — so both writes have to be in the
+  *same* transaction. Second, catching the unique-constraint violation and
+  returning normally from inside that same `@Transactional` method does not
+  work either: Hibernate marks the transaction unusable the moment the flush
+  fails, and Spring refuses to "commit" it, throwing
+  `UnexpectedRollbackException` in place of the original error — so the
+  exception has to propagate out of the independent transaction and be caught
+  by the caller's own, unaffected one.
+
+  **Verified:** `IdempotencyConcurrencyTest` fires 16 concurrent identical
+  requests through the real stack and asserts exactly one authorization
+  results; it passed 10/10 consecutive runs. The original reproduction was
+  re-run live against the running server with genuinely concurrent `curl`
+  processes (not single-threaded): all 16 responses returned the same
+  authorization id, and exactly one row exists for that merchant reference.
+  The conflict path (same key, different body still returns `409`) and the
+  full existing suite (36 tests) were confirmed unaffected.
 - **Error handling is not actually uniform**, contradicting *"Errors are RFC
   7807 problem documents, produced in one place so every endpoint fails the
   same shape."* Confirmed by direct testing: a missing `Idempotency-Key`,
@@ -236,16 +264,20 @@ comparison. No deadline was given, so stages are sized relatively.
 
 | Stage | Description | Key deliverable | Effort | Dependencies |
 |---|---|---|---|---|
-| **1. Fix the concurrency race** | Add a unique database constraint check path that actually fails fast (e.g. `saveAndFlush` inside the transaction, or `SELECT ... FOR UPDATE` / `SERIALIZABLE` on the idempotency lookup) and add a concurrency test that fires real parallel requests, not a single-threaded one | A test that reproduces the 5-authorization failure, then proves it fixed | Days | None |
+| **1. Fix the concurrency race** — **DONE, 2026-10-10** | Write the authorization and its idempotency claim together with `entityManager.persist()` in one independent (`REQUIRES_NEW`) transaction, so a collision is a real, catchable constraint violation instead of a silent `merge()` upsert; add a concurrency test that fires real parallel requests | `IdempotencyConcurrencyTest` (16 concurrent identical requests, asserts exactly 1 authorization), and a live re-run of the original reproduction against the running server with genuine concurrent `curl` processes | Days (actual) | None |
 | **2. Fix the error-handling gaps** | Add handlers for `ConstraintViolationException`, `HttpMessageNotReadableException`, `MethodArgumentTypeMismatchException` and `HttpMediaTypeNotSupportedException` so every 4xx is RFC 7807 | Every tested error case in 3C returns a `problem+json` body, none returns 500 | Days | None |
 | **3. Pepper the request fingerprint, or document why not** | Either pepper `request_fingerprint` the same way `card_fingerprint` is peppered, or write down explicitly why the project accepts that asymmetry | A fixed hash path, or a stated, reasoned exception | Days | None |
 | **4. Currency-aware limits** | Use a real ISO-4217 minor-unit table to validate `currency` and to interpret `amountMinor` per currency in the decision engine | A per-currency limit that means the same real value across currencies | Days to a week | None |
 
 ### 4C. Stage-gate questions
 
-1. **Fix the concurrency race:** After the fix, do 50 concurrent identical
-   requests against a fresh database produce exactly 1 authorization and 49
-   replays, every time, across multiple runs? If not, the fix is not done.
+1. **Fix the concurrency race — answered, 2026-10-10.** Do concurrent
+   identical requests against a fresh database produce exactly 1 authorization
+   and the rest replays, every time, across multiple runs? **Yes, verified at
+   16 concurrency** (not the 50 this question originally asked for): 10/10
+   automated runs and one live run with genuinely concurrent `curl` processes
+   all produced exactly 1 authorization. Higher concurrency, and concurrency
+   against MySQL rather than H2, were not tested and remain open.
 2. **Fix the error-handling gaps:** Does every case in the limitation study's
    item 4 now return `application/problem+json` with a `4xx` status and never
    a `5xx`? A single remaining 500 on bad client input means the gap is not
@@ -266,7 +298,7 @@ comparison. No deadline was given, so stages are sized relatively.
 
 > - **Novelty: Low.** Every individual pattern here (minor-unit money, peppered PAN hashing, idempotency keys, an entity-owned state machine) is standard payments practice; the project's own README frames it as a learning exercise, correctly.
 > - **Recommended scope:** blog post + reference implementation, built around the concurrency-correctness finding below rather than the service as a product.
-> - **Top criticism 1 — the headline idempotency guarantee does not hold under concurrency:** 16 concurrent identical requests produced 5 authorizations instead of 1, directly contradicting the README's claim that a shared transaction plus the primary key prevents this.
+> - **Top criticism 1 — the headline idempotency guarantee did not hold under concurrency, now fixed:** 16 concurrent identical requests produced 5 authorizations instead of 1, directly contradicting the README's original claim that a shared transaction plus the primary key prevents this; `IdempotencyClaimer` fixes it (verified 10/10 runs plus one live concurrent-`curl` run), but only at the concurrency and database (H2) tested so far.
 > - **Top criticism 2 — the request-fingerprint hash is unpeppered while the card hash is peppered**, for the exact reason the project's own `CardFingerprinter` Javadoc gives for peppering the latter.
 > - **Approach:** bottom-up. Fix the authorization primitive's concurrency correctness and error-handling completeness before adding scope.
 > - **First next step:** write a real multi-threaded test that fires the same idempotency key concurrently, watch it fail as this review's manual testing did, then fix the lookup-and-insert path to actually serialize on the key.

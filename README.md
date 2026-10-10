@@ -94,25 +94,29 @@ card numbers is small enough to enumerate, and a leaked column of *unpeppered*
 digests would be a leaked column of card numbers. Data you do not hold cannot
 leak.
 
-**Retries are intended to be safe by construction, and currently are not under
-real concurrency.** A client that times out mid-request cannot know whether
-the card was authorized, so it retries — and without an idempotency key the
-cardholder is authorized twice. The stored record also fingerprints the
-request body, which is what makes it honest: without that, a caller could
-authorize $10, reuse the key for $10,000, and be handed the cached approval.
-Same key and same body replays; same key and different body is refused.
+**Retries are safe by construction, including under real concurrency.** A
+client that times out mid-request cannot know whether the card was
+authorized, so it retries — and without an idempotency key the cardholder is
+authorized twice. The stored record also fingerprints the request body, which
+is what makes it honest: without that, a caller could authorize $10, reuse
+the key for $10,000, and be handed the cached approval. Same key and same
+body replays; same key and different body is refused.
 
-**This review found that it does not hold under concurrency.** Sixteen
-concurrent requests carrying the same key and the same body produced **five**
-separate authorizations, not one, with the idempotency record pointing at
-only one of them. `@Transactional` does commit each method on its own, but
-nothing stops two overlapping transactions from both reading "no existing
-record" before either commits its insert — the default isolation does not
-prevent that race — and `JpaRepository.save()` on an entity built with a
-pre-assigned `@Id` performs a merge-style upsert rather than a guaranteed
-`INSERT`, so it does not reliably collide on the primary key the way a plain
-insert would. See [the project analysis](docs/project-analysis.md) for the
-reproduction and the fix this needs.
+**This was found broken under concurrency, and is now fixed.** An earlier
+version of this service let 16 concurrent requests carrying the same key and
+the same body produce **five** separate authorizations, not one. The cause:
+`JpaRepository.save()` on `IdempotencyRecord`, which has a caller-assigned
+`@Id` and no `@Version` field, calls `entityManager.merge()` rather than
+`persist()` — an UPDATE-or-INSERT that silently overwrites which
+authorization a key points at on a collision, instead of failing. The fix,
+in `IdempotencyClaimer`: the authorization and its idempotency claim are now
+written together with `persist()` (always a real `INSERT`) in one independent
+transaction, so a genuine race produces exactly one committed pair and a
+real, catchable failure on every other attempt. Proven by `IdempotencyConcurrencyTest`, which fires 16 concurrent identical
+requests and asserts exactly one authorization results, and passes 10/10
+runs. See [the project analysis](docs/project-analysis.md) for the full
+diagnosis, including how the bug was found (a separate, ad hoc reproduction
+against the pre-fix code, not this test).
 
 **The state machine lives on the entity.** `APPROVED` can become `CAPTURED` or
 `VOIDED`; everything else is terminal. The check sits on `Authorization` rather
@@ -168,7 +172,8 @@ patterns (minor-unit money, peppered card hashing, an entity-owned state
 machine, idempotency keys) with the reasoning written down. The [project
 analysis](docs/project-analysis.md) rates its novelty **Low** — intentionally,
 since the goal was learning the patterns, not inventing new ones — and sets
-out the strongest criticisms, including the concurrency defect above.
+out the strongest criticisms, including the concurrency defect above (now
+fixed) and the others still open.
 
 ## What is deliberately missing
 
@@ -178,9 +183,10 @@ minor-unit enforcement (a `JPY` or `KWD` amount is accepted and limited the
 same way a `USD` one is, despite the reasoning above about why that is
 wrong). Those are the next things, not oversights — and this is a learning
 project, so I would rather it be small and correct than broad and
-hand-waved. The concurrency and error-handling defects in [the project
+hand-waved. The concurrency defect above is fixed; the error-handling gaps
+and the unpeppered request-fingerprint hash in [the project
 analysis](docs/project-analysis.md) are not on this list because they were
-meant to already be solved, and are the priority once discovered.
+meant to already be solved, and are next.
 
 ## Licence
 
