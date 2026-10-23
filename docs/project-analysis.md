@@ -271,13 +271,17 @@ comparison. No deadline was given, so stages are sized relatively.
 
 ### 4C. Stage-gate questions
 
-1. **Fix the concurrency race — answered, 2026-10-10.** Do concurrent
-   identical requests against a fresh database produce exactly 1 authorization
-   and the rest replays, every time, across multiple runs? **Yes, verified at
-   16 concurrency** (not the 50 this question originally asked for): 10/10
-   automated runs and one live run with genuinely concurrent `curl` processes
-   all produced exactly 1 authorization. Higher concurrency, and concurrency
-   against MySQL rather than H2, were not tested and remain open.
+1. **Fix the concurrency race — answered, 2026-10-10; MySQL gap closed,
+   2026-10-24.** Do concurrent identical requests against a fresh database
+   produce exactly 1 authorization and the rest replays, every time, across
+   multiple runs? **Yes, verified at 16 concurrency** (not the 50 this
+   question originally asked for): 10/10 automated runs and one live run with
+   genuinely concurrent `curl` processes all produced exactly 1 authorization.
+   Concurrency against MySQL rather than H2 was tested on 2026-10-24 and found
+   a real, MySQL-only failure (`REPEATABLE READ` snapshot visibility — see the
+   addenda below); fixed the same day by forcing `READ_COMMITTED` on
+   `authorize()`'s transaction, re-verified 10/10 against real MySQL 8. Higher
+   concurrency than 16 was not tested and remains open.
 2. **Fix the error-handling gaps:** Does every case in the limitation study's
    item 4 now return `application/problem+json` with a `4xx` status and never
    a `5xx`? A single remaining 500 on bad client input means the gap is not
@@ -302,3 +306,117 @@ comparison. No deadline was given, so stages are sized relatively.
 > - **Top criticism 2 — the request-fingerprint hash is unpeppered while the card hash is peppered**, for the exact reason the project's own `CardFingerprinter` Javadoc gives for peppering the latter.
 > - **Approach:** bottom-up. Fix the authorization primitive's concurrency correctness and error-handling completeness before adding scope.
 > - **First next step:** write a real multi-threaded test that fires the same idempotency key concurrently, watch it fail as this review's manual testing did, then fix the lookup-and-insert path to actually serialize on the key.
+
+---
+
+## Addendum — 2026-10-24: a stored-procedure invariant audit, and what running it against real Oracle found
+
+Added `audit_authorization_invariants`, a PL/SQL stored procedure
+(`db/migration-oracle/V2`) that independently re-derives three invariants the
+application already enforces on the way in, from the data as it sits on disk:
+every authorization must be referenced by at least one `idempotency_records`
+row; a `CAPTURED` or `VOIDED` row must have `version >= 1`, since those states
+are only reachable through an `UPDATE`; and the decline-reason CHECK
+constraint, restated as an independent, re-runnable query. `InvariantAuditOracleTest`
+proves it against a real local Oracle Database Free 23ai container (Docker,
+arm64-native), not just that it compiles — two of its three tests insert a
+deliberately bad row with plain JDBC, bypassing the entity entirely (it has no
+constructor that can produce either shape), and assert the procedure catches
+it. 3/3 pass against the real instance.
+
+**Getting a migration to actually run against real Oracle, for the first time
+this project has ever had one, found two genuine portability bugs that H2 and
+MySQL had been silently tolerating:**
+
+1. **`version BIGINT NOT NULL DEFAULT 0` is invalid Oracle DDL
+   (`ORA-03076`).** MySQL and H2 both accept `DEFAULT` after `NOT NULL`;
+   Oracle requires it before. Fixed in `db/migration/V1` itself, in place
+   (not a new migration): V1 had never once applied successfully on Oracle,
+   so there was no already-applied state anywhere to preserve, and the
+   corrected clause order (`DEFAULT 0 NOT NULL`) is accepted identically by
+   MySQL and H2.
+2. **`BIGINT` is not an Oracle data type at all (`ORA-00902`).** Oracle has
+   no `BIGINT`; `NUMBER` is the only integer type it recognises. This is a
+   structural difference, not a clause-order typo, so rather than force one
+   migration file to speak three SQL dialects, Oracle now gets its own
+   complete schema history (`db/migration-oracle/V1`, `NUMBER(19)` instead of
+   `BIGINT`, `VARCHAR2` instead of `VARCHAR`) rather than extending the
+   shared one. `application-oracle.yml`'s `flyway.locations` points only at
+   `db/migration-oracle`.
+
+A third issue surfaced one level up, in Hibernate rather than Flyway:
+**reading an `Instant` column back through Oracle failed with `ORA-18716`
+("not in any time zone")**, regardless of JVM or session time zone — ruled
+out by forcing the JVM to UTC and retesting, which changed nothing. The cause
+was Hibernate's default JDBC type for `Instant` on `OracleDialect`, which
+reads through an `OffsetDateTime`-typed accessor assuming a `TIMESTAMP WITH
+(LOCAL) TIME ZONE` column; the actual column is a plain `TIMESTAMP(6)`,
+matching the shared schema, which has no zone for the driver to resolve.
+Fixed by pinning `createdAt`/`updatedAt` to the plain `TIMESTAMP` JDBC type
+explicitly (`@JdbcTypeCode(SqlTypes.TIMESTAMP)` on `Authorization`) rather
+than leaving it to the dialect's default — a no-op on H2 and MySQL, confirmed
+by re-running the full default-profile suite after the change (40/40 pass).
+
+**A fourth finding, unrelated to Oracle, surfaced while confirming none of
+the above broke the mysql profile:** running the existing
+`IdempotencyConcurrencyTest` against a real local MySQL 8 container for the
+first time — something this project's own stage-gate question 1 above
+already flagged as "not tested, remains open" — it fails.
+`AuthorizationService.authorize()` throws `IllegalStateException: lost the
+idempotency race... but found no winning record`: the losing transaction's
+read-after-catch does not see the row that must have just violated the
+unique constraint, consistent with MySQL's default `REPEATABLE READ`
+isolation giving that read a snapshot taken before the winner's commit — a
+difference from H2's effectively `READ_COMMITTED`-like default that the
+original concurrency fix was never tested against. Fixed below.
+
+**Verification:** `mvn test` (default/H2 profile) — 40 tests, 37 run, 3 skip
+with a stated reason outside the oracle profile, all green.
+`InvariantAuditOracleTest` against real Oracle 23ai Free — 3/3 pass.
+`mvn test -Dspring.profiles.active=mysql` against real MySQL 8, before the
+fix below — 39/40 pass, 1 pre-existing failure (the race-visibility gap
+above, not caused by this addendum's earlier changes).
+
+## Addendum — 2026-10-24: the MySQL race-visibility gap above, fixed
+
+Confirmed the mechanism directly rather than trusting the isolation-level
+guess above: `SELECT @@session.transaction_isolation` against the same
+container returns `REPEATABLE-READ`, and `AuthorizationService.authorize()`
+carried a bare `@Transactional` — the database's default isolation, not an
+explicit one. Under MySQL's InnoDB, a plain (non-locking) `SELECT` inside a
+`REPEATABLE READ` transaction does not get its own snapshot; the whole
+transaction shares the snapshot taken by its *first* consistent read. In
+`authorize()`, that first read is the idempotency lookup at the top of the
+method. By the time the retry lookup in the `catch` block runs, a concurrent
+winner's `IdempotencyClaimer.claim()` — its own independent `REQUIRES_NEW`
+transaction — has already committed, but that commit happened *after* this
+transaction's snapshot was fixed, so the now-existing row stays invisible to
+the retry read. `findById` correctly reports "not found" for the snapshot it
+is looking through; the bug was trusting that snapshot to reflect a write
+that, by construction, could only happen concurrently with it. H2 was never
+going to reproduce this: its default isolation behaves like `READ_COMMITTED`,
+which takes a fresh snapshot per statement and so always sees a commit that
+landed before the current statement started.
+
+**Fix:** `authorize()` is now `@Transactional(isolation =
+Isolation.READ_COMMITTED)` rather than the bare `@Transactional`. Forcing
+`READ_COMMITTED` for this transaction means every plain read it issues — the
+initial lookup and the retry lookup alike — takes its own fresh snapshot, so
+the retry after a lost race sees whatever is actually committed at that
+moment, including a winner that committed in between. This is a narrower
+fix than it might look: it does not touch `IdempotencyClaimer.claim()` (the
+`REQUIRES_NEW` transaction that performs the actual insert and already
+behaves correctly at any isolation level, since the constraint violation
+itself is what detects the race), only the losing side's ability to then go
+look up what it lost to.
+
+**Verified at the same rigor as the original concurrency fix:** 10/10
+automated runs of `IdempotencyConcurrencyTest` against a real local MySQL 8
+container (16 concurrent identical requests, each run against a freshly
+recreated `payments` database so no run could pass on a leftover row from
+the previous one), all green. `mvn test` (default/H2 profile) — 40 tests, 37
+run, 3 skip, unchanged, all green. `mvn test
+-Dspring.profiles.active=mysql` against the same MySQL 8 container — 40/40
+pass, closing the one pre-existing failure above. Stage-gate question 1's
+"concurrency against MySQL rather than H2... not tested and remain open" is
+now answered: tested, and fixed.

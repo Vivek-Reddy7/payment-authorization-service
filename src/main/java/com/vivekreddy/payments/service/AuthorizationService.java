@@ -19,6 +19,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
@@ -63,7 +64,21 @@ public class AuthorizationService {
      *                       the original authorization rather than a second one
      * @throws IdempotencyConflictException if the key was used with a different body
      */
-    @Transactional
+    // READ_COMMITTED, not the database default: on MySQL (REPEATABLE READ),
+    // InnoDB's consistent read fixes this transaction's snapshot at its first
+    // read -- the findById below -- and every later plain SELECT in the same
+    // transaction reuses that snapshot rather than taking a new one. The
+    // retry read in the catch block below is exactly such a later read: by
+    // the time it runs, the concurrent winner's claim() has committed in its
+    // own transaction, but that commit lands after this snapshot was taken,
+    // so the now-existing row stays invisible to it and findById() returns
+    // empty -- not because no winner exists, but because this transaction
+    // cannot see one that does. READ_COMMITTED takes a fresh snapshot per
+    // statement instead, so the retry read sees the winner's committed row.
+    // H2 does not reproduce this: its default isolation behaves like
+    // READ_COMMITTED already, which is why this surfaced only against real
+    // MySQL. See docs/project-analysis.md's 2026-10-24 addendum.
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public Authorization authorize(AuthorizationRequest request, String idempotencyKey) {
         String fingerprint = fingerprinter.hash(canonical(request));
 

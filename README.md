@@ -34,6 +34,18 @@ Against MySQL instead:
 DB_PASSWORD=... ./mvnw spring-boot:run -Dspring-boot.run.profiles=mysql
 ```
 
+Against a local Oracle Database Free 23ai container, to exercise the
+stored-procedure invariant audit below:
+
+```bash
+docker run -d --name payments-oracle -p 1521:1521 \
+  -e ORACLE_PWD=... container-registry.oracle.com/database/free:latest
+# then, once it logs "DATABASE IS READY TO USE", create the payments user
+# (CONNECT, RESOURCE, CREATE PROCEDURE, CREATE SEQUENCE) and:
+DB_URL=jdbc:oracle:thin:@localhost:1521/FREEPDB1 DB_USER=payments DB_PASSWORD=... \
+  ./mvnw spring-boot:run -Dspring-boot.run.profiles=oracle
+```
+
 ## Try it
 
 ```bash
@@ -118,6 +130,40 @@ runs. See [the project analysis](docs/project-analysis.md) for the full
 diagnosis, including how the bug was found (a separate, ad hoc reproduction
 against the pre-fix code, not this test).
 
+**That fix was verified against H2 only, and MySQL found a second,
+narrower race.** Running the same `IdempotencyConcurrencyTest` against a
+real MySQL 8 instance for the first time failed with `IllegalStateException:
+lost the idempotency race... but found no winning record`. The cause this
+time was isolation, not `merge()`: MySQL's default `REPEATABLE READ` fixes a
+transaction's snapshot at its first read, so `authorize()`'s retry lookup
+after a lost race reused the snapshot taken before the winner's commit and
+could not see the row that had, by then, genuinely been written. H2's
+default isolation behaves like `READ_COMMITTED`, which is why the original
+fix never exposed this. The fix: `authorize()` now runs at
+`@Transactional(isolation = Isolation.READ_COMMITTED)` explicitly, so every
+plain read it issues takes its own fresh snapshot. Verified 10/10 against a
+real MySQL 8 container, each run against a freshly recreated database. See
+[the project analysis](docs/project-analysis.md) for the full diagnosis.
+
+**A stored procedure independently re-audits what the state machine already
+enforces, because write-time guards only see the write they were called
+for.** `audit_authorization_invariants` (Oracle only, `db/migration-oracle/V2`)
+re-derives three things from the data as it sits on disk, not from what the
+application code claims on the way in: every authorization must be
+referenced by at least one `idempotency_records` row (nothing in the schema
+enforces that direction of the foreign key, and it is exactly what the
+earlier concurrency bug would have violated had it shipped); a `CAPTURED` or
+`VOIDED` row must have `version >= 1`, since those states are only reachable
+through an `UPDATE`, never an `INSERT`; and the decline-reason CHECK
+constraint, restated as an independent, re-runnable query rather than trusted
+never to have been bypassed. `InvariantAuditOracleTest` proves this against a
+real instance, not just that it compiles: two of its three tests insert a
+deliberately bad row with plain JDBC (an entity has no constructor that can
+produce either shape) and assert the procedure catches it. Getting this
+running against real Oracle also found two real portability bugs this
+project had never been tested against before Oracle existed to catch them —
+see [the project analysis](docs/project-analysis.md) for both.
+
 **The state machine lives on the entity.** `APPROVED` can become `CAPTURED` or
 `VOIDED`; everything else is terminal. The check sits on `Authorization` rather
 than in the service, so no future caller can route around it. Capturing twice is
@@ -127,11 +173,14 @@ requested status in the body — and it has its own test.
 ## Layout
 
 ```
-api/          controllers, DTOs, the Luhn validator, one exception handler
-domain/       entities, the status state machine, domain exceptions
-service/      decision engine, card fingerprinting, orchestration
-repository/   Spring Data JPA
-db/migration/ Flyway, forward-only
+api/                  controllers, DTOs, the Luhn validator, one exception handler
+domain/               entities, the status state machine, domain exceptions
+service/               decision engine, card fingerprinting, orchestration,
+                       the Oracle-only invariant auditor (plain JDBC, not JPA)
+repository/            Spring Data JPA
+db/migration/          Flyway, forward-only, H2 and MySQL
+db/migration-oracle/   Flyway, forward-only, Oracle's own complete history --
+                       not an extension of db/migration (see project analysis)
 ```
 
 Schema comes from Flyway and Hibernate is set to `validate`, never `ddl-auto`.
@@ -140,7 +189,10 @@ from. There are no down scripts for the same reason — fix forward with `V2`.
 
 ## Tests
 
-36 tests, all green, no network and no database to install.
+40 tests. 37 run with no network and no database to install; the other 3
+(`InvariantAuditOracleTest`) need a real Oracle instance and skip themselves
+cleanly otherwise -- same convention as the mysql profile, exercised by
+running it, not by CI.
 
 The decision engine is a pure function — it reads no clock and touches no
 database, because "today" is an argument — so its rules are unit tested
