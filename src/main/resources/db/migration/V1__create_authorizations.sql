@@ -31,7 +31,11 @@ CREATE TABLE authorizations (
 
     created_at          TIMESTAMP(6) NOT NULL,
     updated_at          TIMESTAMP(6) NOT NULL,
-    version             BIGINT       NOT NULL DEFAULT 0,
+    -- DEFAULT before NOT NULL, not after: MySQL and H2 both accept either
+    -- clause order, but Oracle requires DEFAULT first and throws ORA-03076
+    -- on the reverse -- found running this migration against a real Oracle
+    -- instance for the first time (see db/migration-oracle).
+    version             BIGINT       DEFAULT 0 NOT NULL,
 
     CONSTRAINT pk_authorizations PRIMARY KEY (id),
 

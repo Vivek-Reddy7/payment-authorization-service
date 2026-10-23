@@ -1,0 +1,24 @@
+# Run with: --spring.profiles.active=oracle
+#
+# Mirrors application-mysql.yml: nothing here carries a credential, the URL,
+# user and password all come from the environment, and the schema comes from
+# Flyway, never Hibernate. This profile exists to run the invariant-audit
+# stored procedure (db/migration-oracle/V2) against a real Oracle instance --
+# PL/SQL is not something H2 or the mysql profile can exercise. Like the mysql
+# profile, this one is exercised by running it, not by CI.
+#
+# flyway.locations points ONLY at db/migration-oracle, not the shared
+# db/migration too: Oracle has no BIGINT type (db/migration/V1 uses it, and
+# fails on Oracle with ORA-00902), so db/migration-oracle carries its own
+# complete, Oracle-native schema history rather than extending the shared one.
+spring:
+  datasource:
+    url: ${DB_URL:jdbc:oracle:thin:@localhost:1521/FREEPDB1}
+    username: ${DB_USER:payments}
+    password: ${DB_PASSWORD}
+    driver-class-name: oracle.jdbc.OracleDriver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    locations: classpath:db/migration-oracle

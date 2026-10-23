@@ -73,9 +73,21 @@ public class Authorization {
     @Column(name = "decline_reason", length = 32)
     private DeclineReason declineReason;
 
+    // Pinned to the plain TIMESTAMP JDBC type rather than left to the
+    // dialect's default for Instant. Oracle's default for Instant columns
+    // reads back through an OffsetDateTime-typed accessor that assumes a
+    // TIMESTAMP WITH (LOCAL) TIME ZONE column; ours is a plain TIMESTAMP(6)
+    // (see db/migration-oracle/V1), which has no zone for the driver to
+    // resolve, so every read failed with ORA-18716 regardless of JVM or
+    // session time zone. This column really is a bare timestamp -- now() in
+    // AuthorizationService always truncates to a UTC Instant before it gets
+    // here -- so pinning the JDBC type to match is the honest fix, not an
+    // Oracle-only workaround; it is a no-op on H2 and MySQL.
+    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    @JdbcTypeCode(SqlTypes.TIMESTAMP)
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
